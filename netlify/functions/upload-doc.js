@@ -45,11 +45,16 @@ exports.handler = async (event) => {
       'Authorization': `Bearer ${NOTION_TOKEN}`,
       'Notion-Version': '2022-06-28',
     };
+    // File upload API requires a newer version header
+    const nhUpload = {
+      'Authorization': `Bearer ${NOTION_TOKEN}`,
+      'Notion-Version': '2024-05-13',
+    };
 
     // ── Step 1: Create file upload object in Notion ───────────────────────
     const createResp = await fetch('https://api.notion.com/v1/file-uploads', {
       method: 'POST',
-      headers: { ...nh, 'Content-Type': 'application/json' },
+      headers: { ...nhUpload, 'Content-Type': 'application/json' },
       body: JSON.stringify({ mode: 'single-part' })
     });
     const createData = await createResp.json();
@@ -77,7 +82,7 @@ exports.handler = async (event) => {
     const sendResp = await fetch(upload_url, {
       method: 'POST',
       headers: {
-        ...nh,
+        ...nhUpload,
         'Content-Type': `multipart/form-data; boundary=${fileBoundary}`,
       },
       body: combined
