@@ -55,7 +55,11 @@ exports.handler = async (event) => {
     const createResp = await fetch('https://api.notion.com/v1/file-uploads', {
       method: 'POST',
       headers: { ...nhUpload, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: 'single-part' })
+      body: JSON.stringify({
+        mode: 'single_part',
+        filename: file.filename,
+        content_type: file.contentType || 'application/octet-stream'
+      })
     });
     const createData = await createResp.json();
 
