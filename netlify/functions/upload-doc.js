@@ -2,12 +2,11 @@ const NOTION_TOKEN = process.env.NOTION_TOKEN;
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const VA_EMAIL = process.env.VA_EMAIL || 'bo@halo-hospitality.com';
 
-// Field mapping from upload key to Notion property name
 const FIELD_MAP = {
-  'insurance':     'Insurance Upload',
-  'county_license':'County License Upload',
-  'city_license':  'City License Upload',
-  'str_permit':    'STR Permit Upload',
+  'insurance':      'Insurance Upload',
+  'county_license': 'County License Upload',
+  'city_license':   'City License Upload',
+  'str_permit':     'STR Permit Upload',
 };
 
 exports.handler = async (event) => {
@@ -21,22 +20,13 @@ exports.handler = async (event) => {
   if (event.httpMethod !== 'POST') return { statusCode: 405, headers, body: JSON.stringify({ error: 'Method not allowed' }) };
 
   try {
-    // Parse multipart form data
     const contentType = event.headers['content-type'] || '';
-    if (!contentType.includes('multipart/form-data')) {
-      return { statusCode: 400, headers, body: JSON.stringify({ error: 'Expected multipart/form-data' }) };
-    }
+    const boundary = contentType.split('boundary=')[1]?.split(';')[0]?.trim();
+    if (!boundary) return { statusCode: 400, headers, body: JSON.stringify({ error: 'No boundary found in content-type: ' + contentType }) };
 
-    // Extract boundary
-    const boundary = contentType.split('boundary=')[1];
-    if (!boundary) return { statusCode: 400, headers, body: JSON.stringify({ error: 'No boundary' }) };
-
-    // Parse the body
-    const bodyBuffer = event.isBase64Encoded
-      ? Buffer.from(event.body, 'base64')
-      : Buffer.from(event.body);
-
+    const bodyBuffer = Buffer.from(event.body, event.isBase64Encoded ? 'base64' : 'binary');
     const parts = parseMultipart(bodyBuffer, boundary);
+
     const field     = parts.fields?.field;
     const pageId    = parts.fields?.pageId;
     const ownerName = parts.fields?.ownerName || '';
@@ -45,7 +35,7 @@ exports.handler = async (event) => {
     const file      = parts.files?.file;
 
     if (!field || !pageId || !file) {
-      return { statusCode: 400, headers, body: JSON.stringify({ error: 'Missing required fields' }) };
+      return { statusCode: 400, headers, body: JSON.stringify({ error: 'Missing fields', got: { field, pageId, hasFile: !!file } }) };
     }
 
     const notionField = FIELD_MAP[field];
@@ -54,70 +44,109 @@ exports.handler = async (event) => {
     const nh = {
       'Authorization': `Bearer ${NOTION_TOKEN}`,
       'Notion-Version': '2022-06-28',
-      'Content-Type': 'application/json'
     };
 
-    // Step 1: Create an upload URL in Notion
-    const uploadResp = await fetch('https://api.notion.com/v1/file-uploads', {
+    // ── Step 1: Create file upload object in Notion ───────────────────────
+    const createResp = await fetch('https://api.notion.com/v1/file-uploads', {
       method: 'POST',
-      headers: nh,
+      headers: { ...nh, 'Content-Type': 'application/json' },
       body: JSON.stringify({ mode: 'single-part' })
     });
-    const uploadData = await uploadResp.json();
+    const createData = await createResp.json();
 
-    if (uploadData.object === 'error') {
-      // Fallback: store as external URL note if file upload API not available
-      // Just log the upload intent in Notes
-      const nowDisplay = new Date().toLocaleString('en-US', { timeZone: 'America/New_York', dateStyle: 'short', timeStyle: 'short' });
-      const getResp = await fetch(`https://api.notion.com/v1/pages/${pageId}`, { headers: nh });
-      const pageData = await getResp.json();
-      const existing = pageData.properties?.Notes?.rich_text?.[0]?.plain_text || '';
-      const note = `[${nowDisplay}] 📎 Owner uploaded: ${label} (${file.filename}) — file pending manual attachment`;
-      const updated = existing ? `${existing}\n${note}` : note;
-      await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
-        method: 'PATCH', headers: nh,
-        body: JSON.stringify({ properties: { Notes: { rich_text: [{ type: 'text', text: { content: updated.substring(0, 2000) } }] } } })
-      });
-
-      // Send email with file attached
-      await sendEmailNotification(ownerName, address, label, file, pageId);
-      return { statusCode: 200, headers, body: JSON.stringify({ success: true, method: 'email' }) };
+    if (createData.object === 'error') {
+      // Log the actual error for debugging, fall back to email
+      console.error('Notion file-uploads create error:', JSON.stringify(createData));
+      await logToNotes(pageId, label, file.filename, nh);
+      await sendEmail(ownerName, address, label, file);
+      return { statusCode: 200, headers, body: JSON.stringify({ success: true, method: 'email_fallback', notionError: createData.message }) };
     }
 
-    // Step 2: Upload the file to Notion's storage
-    const { upload_url, id: fileId } = uploadData;
-    const formData = new FormData();
-    const blob = new Blob([file.data], { type: file.contentType || 'application/octet-stream' });
-    formData.append('file', blob, file.filename);
+    // ── Step 2: Send the file binary to Notion's upload URL ───────────────
+    const { upload_url, id: fileUploadId } = createData;
 
-    await fetch(upload_url, { method: 'POST', body: formData });
+    // Build multipart body for the send-file call
+    const fileBoundary = '----HaloUploadBoundary' + Date.now();
+    const fileHeader = `--${fileBoundary}\r\nContent-Disposition: form-data; name="file"; filename="${file.filename}"\r\nContent-Type: ${file.contentType || 'application/octet-stream'}\r\n\r\n`;
+    const fileFooter = `\r\n--${fileBoundary}--\r\n`;
 
-    // Step 3: Attach the uploaded file to the Notion page property
-    await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
-      method: 'PATCH', headers: nh,
+    const headerBuf = Buffer.from(fileHeader);
+    const footerBuf = Buffer.from(fileFooter);
+    const combined = Buffer.concat([headerBuf, file.data, footerBuf]);
+
+    const sendResp = await fetch(upload_url, {
+      method: 'POST',
+      headers: {
+        ...nh,
+        'Content-Type': `multipart/form-data; boundary=${fileBoundary}`,
+      },
+      body: combined
+    });
+    const sendData = await sendResp.json();
+
+    if (sendData.object === 'error' || sendData.status !== 'uploaded') {
+      console.error('Notion send-file error:', JSON.stringify(sendData));
+      await logToNotes(pageId, label, file.filename, nh);
+      await sendEmail(ownerName, address, label, file);
+      return { statusCode: 200, headers, body: JSON.stringify({ success: true, method: 'email_fallback', sendError: sendData.message }) };
+    }
+
+    // ── Step 3: Attach the uploaded file to the Notion page property ──────
+    const attachResp = await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
+      method: 'PATCH',
+      headers: { ...nh, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         properties: {
           [notionField]: {
-            files: [{ type: 'file', name: file.filename, file: { id: fileId } }]
+            files: [{
+              type: 'file',
+              name: file.filename,
+              file: { id: fileUploadId }
+            }]
           }
         }
       })
     });
+    const attachData = await attachResp.json();
 
-    // Also send email notification
-    await sendEmailNotification(ownerName, address, label, file, pageId);
+    if (attachData.object === 'error') {
+      console.error('Notion attach error:', JSON.stringify(attachData));
+      await logToNotes(pageId, label, file.filename, nh);
+      await sendEmail(ownerName, address, label, file);
+      return { statusCode: 200, headers, body: JSON.stringify({ success: true, method: 'email_fallback', attachError: attachData.message }) };
+    }
 
+    // ── Success: also send email notification ─────────────────────────────
+    await sendEmail(ownerName, address, label, file);
     return { statusCode: 200, headers, body: JSON.stringify({ success: true, method: 'notion' }) };
 
   } catch (err) {
-    console.error('Upload error:', err);
+    console.error('Upload handler error:', err);
     return { statusCode: 500, headers, body: JSON.stringify({ error: err.message }) };
   }
 };
 
-async function sendEmailNotification(ownerName, address, label, file, pageId) {
-  const nowDisplay = new Date().toLocaleString('en-US', { timeZone: 'America/New_York', dateStyle: 'long', timeStyle: 'short' });
+// ── Append note to Notion Notes field ────────────────────────────────────────
+async function logToNotes(pageId, label, filename, nh) {
   try {
+    const getResp = await fetch(`https://api.notion.com/v1/pages/${pageId}`, { headers: nh });
+    const pageData = await getResp.json();
+    const existing = pageData.properties?.Notes?.rich_text?.[0]?.plain_text || '';
+    const ts = new Date().toLocaleString('en-US', { timeZone: 'America/New_York', dateStyle: 'short', timeStyle: 'short' });
+    const note = `[${ts}] 📎 Owner uploaded: ${label} — ${filename}`;
+    const updated = existing ? `${existing}\n${note}` : note;
+    await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
+      method: 'PATCH',
+      headers: { ...nh, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ properties: { Notes: { rich_text: [{ type: 'text', text: { content: updated.substring(0, 2000) } }] } } })
+    });
+  } catch(e) { console.error('logToNotes error:', e.message); }
+}
+
+// ── Send email notification ───────────────────────────────────────────────────
+async function sendEmail(ownerName, address, label, file) {
+  try {
+    const ts = new Date().toLocaleString('en-US', { timeZone: 'America/New_York', dateStyle: 'long', timeStyle: 'short' });
     await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
@@ -135,66 +164,66 @@ async function sendEmailNotification(ownerName, address, label, file, pageId) {
               <p style="margin:0 0 4px;color:#888;font-size:13px">Owner</p><p style="margin:0 0 16px;font-weight:500">${ownerName}</p>
               <p style="margin:0 0 4px;color:#888;font-size:13px">Property</p><p style="margin:0 0 16px;font-weight:500">${address}</p>
               <p style="margin:0 0 4px;color:#888;font-size:13px">Document</p><p style="margin:0 0 16px;font-weight:500">${label}</p>
-              <p style="margin:0 0 4px;color:#888;font-size:13px">Filename</p><p style="margin:0 0 16px">${file?.filename || 'N/A'}</p>
-              <p style="margin:0 0 4px;color:#888;font-size:13px">Uploaded</p><p style="margin:0 0 24px">${nowDisplay}</p>
-              <p style="margin:0;font-size:13px;color:#888">Check the owner's property record to find the attached document.</p>
+              <p style="margin:0 0 4px;color:#888;font-size:13px">File</p><p style="margin:0 0 24px">${file?.filename || 'N/A'}</p>
+              <p style="margin:0 0 4px;color:#888;font-size:13px">Uploaded</p><p style="margin:0">${ts}</p>
             </div>
           </div>`
       })
     });
-  } catch(e) { console.error('Email error:', e.message); }
+  } catch(e) { console.error('sendEmail error:', e.message); }
 }
 
-// Simple multipart parser
+// ── Multipart parser ──────────────────────────────────────────────────────────
 function parseMultipart(buffer, boundary) {
   const fields = {};
   const files = {};
   const boundaryBuf = Buffer.from('--' + boundary);
-  let pos = 0;
 
+  let pos = 0;
   while (pos < buffer.length) {
     const start = indexOf(buffer, boundaryBuf, pos);
     if (start === -1) break;
     pos = start + boundaryBuf.length;
-    if (buffer[pos] === 45 && buffer[pos+1] === 45) break; // --
-    if (buffer[pos] === 13) pos += 2; // \r\n
+    if (buffer[pos] === 45 && buffer[pos+1] === 45) break; // final --
+    if (buffer[pos] === 13) pos += 2; // skip \r\n
 
-    // Find header end
     const headerEnd = indexOf(buffer, Buffer.from('\r\n\r\n'), pos);
     if (headerEnd === -1) break;
-    const headerStr = buffer.slice(pos, headerEnd).toString();
+
+    const headerStr = buffer.slice(pos, headerEnd).toString('utf8');
     pos = headerEnd + 4;
 
-    // Find next boundary
     const nextBoundary = indexOf(buffer, boundaryBuf, pos);
     const dataEnd = nextBoundary === -1 ? buffer.length : nextBoundary - 2;
     const data = buffer.slice(pos, dataEnd);
+    pos = nextBoundary !== -1 ? nextBoundary : buffer.length;
 
-    // Parse header
     const nameMatch = headerStr.match(/name="([^"]+)"/);
     const filenameMatch = headerStr.match(/filename="([^"]+)"/);
     const ctMatch = headerStr.match(/Content-Type:\s*([^\r\n]+)/i);
 
     if (nameMatch) {
-      const name = nameMatch[1];
       if (filenameMatch) {
-        files[name] = { filename: filenameMatch[1], data, contentType: ctMatch?.[1]?.trim() };
+        files[nameMatch[1]] = {
+          filename: filenameMatch[1],
+          data,
+          contentType: ctMatch?.[1]?.trim() || 'application/octet-stream'
+        };
       } else {
-        fields[name] = data.toString();
+        fields[nameMatch[1]] = data.toString('utf8');
       }
     }
-    pos = nextBoundary !== -1 ? nextBoundary : buffer.length;
   }
   return { fields, files };
 }
 
 function indexOf(buf, search, start = 0) {
   for (let i = start; i <= buf.length - search.length; i++) {
-    let found = true;
+    let match = true;
     for (let j = 0; j < search.length; j++) {
-      if (buf[i+j] !== search[j]) { found = false; break; }
+      if (buf[i+j] !== search[j]) { match = false; break; }
     }
-    if (found) return i;
+    if (match) return i;
   }
   return -1;
 }
