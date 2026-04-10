@@ -91,7 +91,8 @@ exports.handler = async (event) => {
       review30PDF: files(p['Review 30 Day PDF']),
       review30Date: dt(p['Review 30 Day Date']),
       review90PDF: files(p['Review 90 Day PDF']),
-      review90Date: dt(p['Review 90 Day Date'])
+      review90Date: dt(p['Review 90 Day Date']),
+      dynamicPricingSetup: dt(p['Dynamic Pricing Setup'])
     })};
   } catch (err) {
     return { statusCode: 500, headers, body: JSON.stringify({ error: err.message }) };
