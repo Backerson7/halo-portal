@@ -1,3 +1,14 @@
 [build]
   functions = "netlify/functions"
   publish = "public"
+
+# Allow the upload-doc function to receive binary file data
+[functions."upload-doc"]
+  included_files = []
+
+[[headers]]
+  for = "/.netlify/functions/upload-doc"
+  [headers.values]
+    Access-Control-Allow-Origin = "*"
+    Access-Control-Allow-Methods = "POST, OPTIONS"
+    Access-Control-Allow-Headers = "Content-Type"
