@@ -3,11 +3,7 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const VA_EMAIL = process.env.VA_EMAIL || 'bo@halo-hospitality.com';
 const GDRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
 const SERVICE_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
-const PRIVATE_KEY = (() => {
-  const raw = process.env.GOOGLE_PRIVATE_KEY || '';
-  // Handle both literal \n and actual newlines
-  return raw.includes('\\n') ? raw.replace(/\\n/g, '\n') : raw;
-})();
+const PRIVATE_KEY = Buffer.from(process.env.GOOGLE_PRIVATE_KEY_B64 || '', 'base64').toString('utf8');
 
 const NOTION_FIELD_MAP = {
   'insurance':      'Insurance Upload',
