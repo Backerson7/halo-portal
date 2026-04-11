@@ -2,8 +2,7 @@ const NOTION_TOKEN = process.env.NOTION_TOKEN;
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const VA_EMAIL = process.env.VA_EMAIL || 'bo@halo-hospitality.com';
 const CLOUDINARY_CLOUD = process.env.CLOUDINARY_CLOUD_NAME || 'dn6yvnwwu';
-const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
-const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
+const CLOUDINARY_PRESET = process.env.CLOUDINARY_UPLOAD_PRESET || 'halo-portal';
 
 const NOTION_FIELD_MAP = {
   'insurance':      'Insurance Upload',
@@ -18,7 +17,6 @@ exports.handler = async (event) => {
     'Access-Control-Allow-Headers': 'Content-Type',
     'Content-Type': 'application/json'
   };
-
   if (event.httpMethod === 'OPTIONS') return { statusCode: 200, headers, body: '' };
   if (event.httpMethod !== 'POST') return { statusCode: 405, headers, body: JSON.stringify({ error: 'Method not allowed' }) };
 
@@ -41,60 +39,37 @@ exports.handler = async (event) => {
       return { statusCode: 400, headers, body: JSON.stringify({ error: 'Missing fields' }) };
     }
 
-    const nh = {
-      'Authorization': `Bearer ${NOTION_TOKEN}`,
-      'Notion-Version': '2022-06-28',
-      'Content-Type': 'application/json'
-    };
+    const nh = { 'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' };
     const ts = new Date().toLocaleString('en-US', { timeZone: 'America/New_York', dateStyle: 'short', timeStyle: 'short' });
     const notionField = NOTION_FIELD_MAP[field];
     let fileUrl = null;
-    let method = 'notion_only';
 
-    // ── Step 1: Try Cloudinary upload ─────────────────────────────────────
+    // ── Step 1: Upload to Cloudinary using UNSIGNED preset ────────────────
+    // No signature needed — preset handles permissions
     try {
-      const crypto = require('crypto');
-      const timestamp = Math.round(Date.now() / 1000);
-      const folder = `halo-portal/${pageId.replace(/-/g,'').substring(0,8)}`;
-      const publicId = `${field}_${timestamp}`;
-
-      // Signature — params must be alphabetically sorted
-      const sigParams = { folder, public_id: publicId, timestamp };
-      const sigStr = Object.keys(sigParams).sort().map(k => `${k}=${sigParams[k]}`).join('&') + CLOUDINARY_API_SECRET;
-      const signature = crypto.createHash('sha1').update(sigStr).digest('hex');
-
-      // Build multipart body for Cloudinary
-      const cldBoundary = 'HaloCldBoundary' + Date.now();
-      const cldParts = [
+      const cldBoundary = 'HaloBoundary' + Date.now();
+      const cldBody = Buffer.concat([
         filePart(cldBoundary, 'file', file.data, file.filename, file.contentType),
-        textPart(cldBoundary, 'folder', folder),
-        textPart(cldBoundary, 'public_id', publicId),
-        textPart(cldBoundary, 'timestamp', String(timestamp)),
-        textPart(cldBoundary, 'api_key', CLOUDINARY_API_KEY),
-        textPart(cldBoundary, 'signature', signature),
+        textPart(cldBoundary, 'upload_preset', CLOUDINARY_PRESET),
         Buffer.from(`--${cldBoundary}--\r\n`)
-      ];
+      ]);
 
       const cldResp = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD}/raw/upload`, {
         method: 'POST',
         headers: { 'Content-Type': `multipart/form-data; boundary=${cldBoundary}` },
-        body: Buffer.concat(cldParts)
+        body: cldBody
       });
       const cldData = await cldResp.json();
 
       if (cldData.secure_url) {
         fileUrl = cldData.secure_url;
-        method = 'cloudinary';
         console.log('Cloudinary upload success:', fileUrl);
       } else {
-        console.error('Cloudinary failed:', JSON.stringify(cldData.error || cldData));
+        console.error('Cloudinary error:', JSON.stringify(cldData.error || cldData));
       }
-    } catch (cldErr) {
-      console.error('Cloudinary exception:', cldErr.message);
-    }
+    } catch (e) { console.error('Cloudinary exception:', e.message); }
 
     // ── Step 2: Always update Notion ──────────────────────────────────────
-    // Update the files field with external URL if we have one
     if (notionField && fileUrl) {
       try {
         await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
@@ -107,23 +82,23 @@ exports.handler = async (event) => {
             }
           })
         });
-      } catch(e) { console.error('Notion field update error:', e.message); }
+      } catch(e) { console.error('Notion field error:', e.message); }
     }
 
-    // Always append to Notes
+    // Always log to Notes
     try {
       const getResp = await fetch(`https://api.notion.com/v1/pages/${pageId}`, { headers: nh });
       const pageData = await getResp.json();
       const existing = pageData.properties?.Notes?.rich_text?.[0]?.plain_text || '';
       const note = fileUrl
-        ? `[${ts}] 📎 Owner uploaded: ${label} — ${file.filename} → ${fileUrl}`
-        : `[${ts}] 📎 Owner uploaded: ${label} — ${file.filename} (file upload pending)`;
+        ? `[${ts}] 📎 Owner uploaded: ${label} — ${file.filename}`
+        : `[${ts}] 📎 Owner attempted upload: ${label} — ${file.filename} (upload failed)`;
       const updated = existing ? `${existing}\n${note}` : note;
       await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
         method: 'PATCH', headers: nh,
         body: JSON.stringify({ properties: { Notes: { rich_text: [{ type: 'text', text: { content: updated.substring(0, 2000) } }] } } })
       });
-    } catch(e) { console.error('Notion notes error:', e.message); }
+    } catch(e) { console.error('Notes error:', e.message); }
 
     // ── Step 3: Send email ────────────────────────────────────────────────
     try {
@@ -146,14 +121,14 @@ exports.handler = async (event) => {
                 <p style="margin:0 0 4px;color:#888;font-size:13px">Property</p><p style="margin:0 0 16px;font-weight:500">${address}</p>
                 <p style="margin:0 0 4px;color:#888;font-size:13px">Document</p><p style="margin:0 0 16px;font-weight:500">${label}</p>
                 <p style="margin:0 0 4px;color:#888;font-size:13px">File</p><p style="margin:0 0 ${fileUrl?'16px':'0'}">${file.filename}</p>
-                ${fileUrl ? `<a href="${fileUrl}" style="display:inline-block;background:#1C1F26;color:#C9A96E;padding:10px 20px;border-radius:6px;text-decoration:none;font-size:13px;font-weight:500;margin-top:8px">View Document ↗</a>` : '<p style="margin:8px 0 0;color:#888;font-size:12px">File available in owner record</p>'}
+                ${fileUrl ? `<a href="${fileUrl}" style="display:inline-block;background:#1C1F26;color:#C9A96E;padding:10px 20px;border-radius:6px;text-decoration:none;font-size:13px;font-weight:500;margin-top:8px">View Document ↗</a>` : ''}
               </div>
             </div>`
         })
       });
     } catch(e) { console.error('Email error:', e.message); }
 
-    return { statusCode: 200, headers, body: JSON.stringify({ success: true, method, url: fileUrl }) };
+    return { statusCode: 200, headers, body: JSON.stringify({ success: true, method: fileUrl ? 'cloudinary' : 'notion_only', url: fileUrl }) };
 
   } catch (err) {
     console.error('Handler error:', err.message);
@@ -164,7 +139,6 @@ exports.handler = async (event) => {
 function textPart(boundary, name, value) {
   return Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`);
 }
-
 function filePart(boundary, name, data, filename, contentType) {
   return Buffer.concat([
     Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"; filename="${filename}"\r\nContent-Type: ${contentType || 'application/octet-stream'}\r\n\r\n`),
@@ -172,7 +146,6 @@ function filePart(boundary, name, data, filename, contentType) {
     Buffer.from('\r\n')
   ]);
 }
-
 function parseMultipart(buffer, boundary) {
   const fields = {}, files = {};
   const sep = Buffer.from('--' + boundary);
@@ -201,7 +174,6 @@ function parseMultipart(buffer, boundary) {
   }
   return { fields, files };
 }
-
 function indexOf(buf, search, start = 0) {
   for (let i = start; i <= buf.length - search.length; i++) {
     let m = true;
