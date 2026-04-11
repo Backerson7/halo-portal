@@ -4,7 +4,7 @@
 
 # Allow the upload-doc function to receive binary file data
 [functions."upload-doc"]
-  included_files = []
+  included_files = ["netlify/functions/service-account.json"]
 
 [[headers]]
   for = "/.netlify/functions/upload-doc"
