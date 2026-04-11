@@ -59,7 +59,8 @@ async function uploadToDrive(token, fileData, filename, mimeType, ownerName, lab
   const metadata = JSON.stringify({
     name: filename,
     parents: [GDRIVE_FOLDER_ID],
-    description: `Uploaded via owner portal — ${label}`
+    description: `Uploaded via owner portal — ${label}`,
+    writersCanShare: true
   });
 
   const body = Buffer.concat([
@@ -69,7 +70,7 @@ async function uploadToDrive(token, fileData, filename, mimeType, ownerName, lab
     Buffer.from(`\r\n--${boundary}--`)
   ]);
 
-  const resp = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink', {
+  const resp = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink&supportsAllDrives=true', {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${token}`,
@@ -80,8 +81,15 @@ async function uploadToDrive(token, fileData, filename, mimeType, ownerName, lab
   const data = await resp.json();
   if (data.error) throw new Error('Drive upload error: ' + JSON.stringify(data.error));
 
-  // Make the file publicly readable so the link works for anyone
-  await fetch(`https://www.googleapis.com/drive/v3/files/${data.id}/permissions`, {
+  // Transfer ownership to Bo so file counts against his quota, not service account
+  await fetch(`https://www.googleapis.com/drive/v3/files/${data.id}/permissions?transferOwnership=true&supportsAllDrives=true`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ role: 'owner', type: 'user', emailAddress: 'bo@halo-hospitality.com' })
+  });
+
+  // Also make publicly readable
+  await fetch(`https://www.googleapis.com/drive/v3/files/${data.id}/permissions?supportsAllDrives=true`, {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ role: 'reader', type: 'anyone' })
