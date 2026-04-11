@@ -48,7 +48,7 @@ exports.handler = async (event) => {
 
     // Generate signature
     const crypto = require('crypto');
-    const sigStr = `access_mode=public&folder=${folder}&public_id=${publicId}&resource_type=auto&timestamp=${timestamp}${CLOUDINARY_API_SECRET}`;
+    const sigStr = `access_mode=public&folder=${folder}&public_id=${publicId}&timestamp=${timestamp}${CLOUDINARY_API_SECRET}`;
     const signature = crypto.createHash('sha1').update(sigStr).digest('hex');
 
     // Build multipart for Cloudinary upload
@@ -58,7 +58,6 @@ exports.handler = async (event) => {
       textPart(cldBoundary, 'folder', folder),
       textPart(cldBoundary, 'public_id', publicId),
       textPart(cldBoundary, 'access_mode', 'public'),
-      textPart(cldBoundary, 'resource_type', 'auto'),
       textPart(cldBoundary, 'timestamp', String(timestamp)),
       textPart(cldBoundary, 'api_key', CLOUDINARY_API_KEY),
       textPart(cldBoundary, 'signature', signature),
