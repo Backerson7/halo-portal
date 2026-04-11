@@ -48,7 +48,7 @@ exports.handler = async (event) => {
 
     // Generate signature
     const crypto = require('crypto');
-    const sigStr = `folder=${folder}&public_id=${publicId}&timestamp=${timestamp}${CLOUDINARY_API_SECRET}`;
+    const sigStr = `access_mode=public&folder=${folder}&public_id=${publicId}&timestamp=${timestamp}${CLOUDINARY_API_SECRET}`;
     const signature = crypto.createHash('sha1').update(sigStr).digest('hex');
 
     // Build multipart for Cloudinary upload
@@ -57,6 +57,7 @@ exports.handler = async (event) => {
       fieldPart(cldBoundary, 'file', file.data, file.filename, file.contentType),
       textPart(cldBoundary, 'folder', folder),
       textPart(cldBoundary, 'public_id', publicId),
+      textPart(cldBoundary, 'access_mode', 'public'),
       textPart(cldBoundary, 'timestamp', String(timestamp)),
       textPart(cldBoundary, 'api_key', CLOUDINARY_API_KEY),
       textPart(cldBoundary, 'signature', signature),
@@ -77,7 +78,9 @@ exports.handler = async (event) => {
       return { statusCode: 200, headers, body: JSON.stringify({ success: true, method: 'email_fallback', error: cldData.error.message }) };
     }
 
-    const fileUrl = cldData.secure_url;
+    // Add fl_attachment so the URL triggers a download instead of a broken page
+    const rawUrl = cldData.secure_url;
+    const fileUrl = rawUrl.replace('/raw/upload/', '/raw/upload/fl_attachment/');
     console.log('Cloudinary upload success:', fileUrl);
 
     // ── Step 2: Save URL to Notion ────────────────────────────────────────
