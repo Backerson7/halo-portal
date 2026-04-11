@@ -2,8 +2,17 @@ const NOTION_TOKEN = process.env.NOTION_TOKEN;
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const VA_EMAIL = process.env.VA_EMAIL || 'bo@halo-hospitality.com';
 const GDRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
-const SERVICE_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
-const PRIVATE_KEY = Buffer.from(process.env.GOOGLE_PRIVATE_KEY_B64 || '', 'base64').toString('utf8');
+// Load service account from bundled file (avoids Lambda 4KB env var limit)
+const SA = (() => {
+  try {
+    return JSON.parse(require('fs').readFileSync(require('path').join(__dirname, 'service-account.json'), 'utf8'));
+  } catch(e) {
+    console.error('Failed to load service-account.json:', e.message);
+    return {};
+  }
+})();
+const SERVICE_EMAIL = SA.client_email;
+const PRIVATE_KEY = SA.private_key;
 
 const NOTION_FIELD_MAP = {
   'insurance':      'Insurance Upload',
