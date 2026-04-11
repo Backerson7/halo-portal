@@ -1,8 +1,9 @@
 const NOTION_TOKEN = process.env.NOTION_TOKEN;
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const VA_EMAIL = process.env.VA_EMAIL || 'bo@halo-hospitality.com';
-const CLOUDINARY_CLOUD = process.env.CLOUDINARY_CLOUD_NAME || 'dn6yvnwwu';
-const CLOUDINARY_PRESET = process.env.CLOUDINARY_UPLOAD_PRESET || 'halo-portal';
+const GDRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
+const SERVICE_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+const PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
 
 const NOTION_FIELD_MAP = {
   'insurance':      'Insurance Upload',
@@ -11,6 +12,76 @@ const NOTION_FIELD_MAP = {
   'str_permit':     'STR Permit Upload',
 };
 
+// ── Google JWT auth ──────────────────────────────────────────────────────────
+async function getGoogleToken() {
+  const crypto = require('crypto');
+  const now = Math.floor(Date.now() / 1000);
+  const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({
+    iss: SERVICE_EMAIL,
+    scope: 'https://www.googleapis.com/auth/drive',
+    aud: 'https://oauth2.googleapis.com/token',
+    exp: now + 3600,
+    iat: now
+  })).toString('base64url');
+
+  const sign = crypto.createSign('RSA-SHA256');
+  sign.update(`${header}.${payload}`);
+  const sig = sign.sign(PRIVATE_KEY, 'base64url');
+  const jwt = `${header}.${payload}.${sig}`;
+
+  const resp = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`
+  });
+  const data = await resp.json();
+  if (!data.access_token) throw new Error('Token error: ' + JSON.stringify(data));
+  return data.access_token;
+}
+
+// ── Upload file to Google Drive ──────────────────────────────────────────────
+async function uploadToDrive(token, fileData, filename, mimeType, ownerName, label) {
+  // Create subfolder structure: Halo Owner Documents / OwnerName / label
+  const subfolderName = `${ownerName} — ${label}`;
+
+  // Build multipart body for Drive upload
+  const boundary = 'HaloDriveBoundary';
+  const metadata = JSON.stringify({
+    name: filename,
+    parents: [GDRIVE_FOLDER_ID],
+    description: `Uploaded via owner portal — ${label}`
+  });
+
+  const body = Buffer.concat([
+    Buffer.from(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n`),
+    Buffer.from(`--${boundary}\r\nContent-Type: ${mimeType || 'application/octet-stream'}\r\n\r\n`),
+    fileData,
+    Buffer.from(`\r\n--${boundary}--`)
+  ]);
+
+  const resp = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': `multipart/related; boundary=${boundary}`
+    },
+    body
+  });
+  const data = await resp.json();
+  if (data.error) throw new Error('Drive upload error: ' + JSON.stringify(data.error));
+
+  // Make the file publicly readable so the link works for anyone
+  await fetch(`https://www.googleapis.com/drive/v3/files/${data.id}/permissions`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ role: 'reader', type: 'anyone' })
+  });
+
+  return data.webViewLink || `https://drive.google.com/file/d/${data.id}/view`;
+}
+
+// ── Main handler ─────────────────────────────────────────────────────────────
 exports.handler = async (event) => {
   const headers = {
     'Access-Control-Allow-Origin': '*',
@@ -30,7 +101,7 @@ exports.handler = async (event) => {
 
     const field     = parts.fields?.field;
     const pageId    = parts.fields?.pageId;
-    const ownerName = parts.fields?.ownerName || '';
+    const ownerName = parts.fields?.ownerName || 'Owner';
     const address   = parts.fields?.address || '';
     const label     = parts.fields?.label || field;
     const file      = parts.files?.file;
@@ -44,32 +115,16 @@ exports.handler = async (event) => {
     const notionField = NOTION_FIELD_MAP[field];
     let fileUrl = null;
 
-    // ── Step 1: Upload to Cloudinary using UNSIGNED preset ────────────────
-    // No signature needed — preset handles permissions
+    // ── Upload to Google Drive ───────────────────────────────────────────────
     try {
-      const cldBoundary = 'HaloBoundary' + Date.now();
-      const cldBody = Buffer.concat([
-        filePart(cldBoundary, 'file', file.data, file.filename, file.contentType),
-        textPart(cldBoundary, 'upload_preset', CLOUDINARY_PRESET),
-        Buffer.from(`--${cldBoundary}--\r\n`)
-      ]);
+      const token = await getGoogleToken();
+      fileUrl = await uploadToDrive(token, file.data, file.filename, file.contentType, ownerName, label);
+      console.log('Drive upload success:', fileUrl);
+    } catch(e) {
+      console.error('Drive upload error:', e.message);
+    }
 
-      const cldResp = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD}/raw/upload`, {
-        method: 'POST',
-        headers: { 'Content-Type': `multipart/form-data; boundary=${cldBoundary}` },
-        body: cldBody
-      });
-      const cldData = await cldResp.json();
-
-      if (cldData.secure_url) {
-        fileUrl = cldData.secure_url;
-        console.log('Cloudinary upload success:', fileUrl);
-      } else {
-        console.error('Cloudinary error:', JSON.stringify(cldData.error || cldData));
-      }
-    } catch (e) { console.error('Cloudinary exception:', e.message); }
-
-    // ── Step 2: Always update Notion ──────────────────────────────────────
+    // ── Update Notion ────────────────────────────────────────────────────────
     if (notionField && fileUrl) {
       try {
         await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
@@ -92,7 +147,7 @@ exports.handler = async (event) => {
       const existing = pageData.properties?.Notes?.rich_text?.[0]?.plain_text || '';
       const note = fileUrl
         ? `[${ts}] 📎 Owner uploaded: ${label} — ${file.filename}`
-        : `[${ts}] 📎 Owner attempted upload: ${label} — ${file.filename} (upload failed)`;
+        : `[${ts}] 📎 Owner upload attempt: ${label} — ${file.filename} (failed)`;
       const updated = existing ? `${existing}\n${note}` : note;
       await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
         method: 'PATCH', headers: nh,
@@ -100,7 +155,7 @@ exports.handler = async (event) => {
       });
     } catch(e) { console.error('Notes error:', e.message); }
 
-    // ── Step 3: Send email ────────────────────────────────────────────────
+    // ── Send email ───────────────────────────────────────────────────────────
     try {
       const nowDisplay = new Date().toLocaleString('en-US', { timeZone: 'America/New_York', dateStyle: 'long', timeStyle: 'short' });
       await fetch('https://api.resend.com/emails', {
@@ -121,31 +176,22 @@ exports.handler = async (event) => {
                 <p style="margin:0 0 4px;color:#888;font-size:13px">Property</p><p style="margin:0 0 16px;font-weight:500">${address}</p>
                 <p style="margin:0 0 4px;color:#888;font-size:13px">Document</p><p style="margin:0 0 16px;font-weight:500">${label}</p>
                 <p style="margin:0 0 4px;color:#888;font-size:13px">File</p><p style="margin:0 0 ${fileUrl?'16px':'0'}">${file.filename}</p>
-                ${fileUrl ? `<a href="${fileUrl}" style="display:inline-block;background:#1C1F26;color:#C9A96E;padding:10px 20px;border-radius:6px;text-decoration:none;font-size:13px;font-weight:500;margin-top:8px">View Document ↗</a>` : ''}
+                ${fileUrl ? `<a href="${fileUrl}" style="display:inline-block;background:#1C1F26;color:#C9A96E;padding:10px 20px;border-radius:6px;text-decoration:none;font-size:13px;font-weight:500;margin-top:8px">View in Google Drive ↗</a>` : ''}
               </div>
             </div>`
         })
       });
     } catch(e) { console.error('Email error:', e.message); }
 
-    return { statusCode: 200, headers, body: JSON.stringify({ success: true, method: fileUrl ? 'cloudinary' : 'notion_only', url: fileUrl }) };
+    return { statusCode: 200, headers, body: JSON.stringify({ success: true, method: fileUrl ? 'google_drive' : 'notion_only', url: fileUrl }) };
 
-  } catch (err) {
+  } catch(err) {
     console.error('Handler error:', err.message);
     return { statusCode: 500, headers, body: JSON.stringify({ error: err.message }) };
   }
 };
 
-function textPart(boundary, name, value) {
-  return Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`);
-}
-function filePart(boundary, name, data, filename, contentType) {
-  return Buffer.concat([
-    Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"; filename="${filename}"\r\nContent-Type: ${contentType || 'application/octet-stream'}\r\n\r\n`),
-    data,
-    Buffer.from('\r\n')
-  ]);
-}
+// ── Multipart parser ─────────────────────────────────────────────────────────
 function parseMultipart(buffer, boundary) {
   const fields = {}, files = {};
   const sep = Buffer.from('--' + boundary);
